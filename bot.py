@@ -1,733 +1,1110 @@
 import os
 import time
-import tempfile
-import logging
 import asyncio
 import math
-import shutil
-from datetime import timedelta
-import platform
+from datetime import datetime as dt
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from telegram.helpers import escape_markdown
+from telethon import TelegramClient, events, Button
+from telethon.errors.rpcerrorlist import MessageNotModifiedError
+from telethon.tl.types import DocumentAttributeVideo
+from telethon.utils import get_display_name
 
-# Set up logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# Initialize the bot
+API_ID = 24955235  # Replace with your API ID
+API_HASH = "f317b3f7bbe390346d8b46868cff0de8"  # Replace with your API hash
+BOT_TOKEN = "7560987376:AAFNJmERp1WT3WgBwkaKV6lqjPxUZ5ZKzak"
+BOT_UN = "VideoTrimmerProBot"  # Your bot username
 
-# Bot token from BotFather
-TOKEN = "7560987376:AAHX_ODhs4gMDIg5Ib3ijaXVE-1E0uNPvz0"
+# Create the client
+bot = TelegramClient('VideoTrimmerBot', API_ID, API_HASH)
 
-# Bot configuration
-class Config:
-    # Telegram standard limits
-    BOT_UPLOAD_LIMIT = 50 * 1024 * 1024  # 50MB
+# Support and info
+SUPPORT_LINK = "https://t.me/your_support_channel"
+THUMBNAIL_PATH = "thumbnails/trim_thumb.jpg"
+
+# Ensure directories exist
+os.makedirs("downloads", exist_ok=True)
+os.makedirs("processed", exist_ok=True)
+os.makedirs("thumbnails", exist_ok=True)
+
+# Create a default thumbnail if it doesn't exist
+if not os.path.exists(THUMBNAIL_PATH):
+    try:
+        os.makedirs(os.path.dirname(THUMBNAIL_PATH), exist_ok=True)
+        with open(THUMBNAIL_PATH, "w") as f:
+            f.write("")  # Create empty file for now, replace with actual thumbnail
+    except Exception as e:
+        print(f"Error creating thumbnail file: {e}")
+        THUMBNAIL_PATH = None
+
+# User state storage
+user_states = {}
+
+class UserState:
+    def __init__(self):
+        self.file_path = None
+        self.start_time = None
+        self.end_time = None
+        self.file_name = None
+        self.original_message = None
+        self.progress_message = None
+        self.last_update_time = 0
+
+
+async def progress_bar(current, total, message, start_time, text="**PROGRESS:**"):
+    """Show a progress bar with percentage and speed"""
+    now = time.time()
+    elapsed_time = now - start_time
+    if current == total or (now - message.state.last_update_time) > 2:  # Update every 2 seconds
+        message.state.last_update_time = now
+        percentage = current * 100 / total
+        speed = current / elapsed_time if elapsed_time > 0 else 0
+        speed_string = f"{humanbytes(speed)}/s"
+        
+        progress = min(int(percentage / 5), 20)  # 20 chars max
+        progress_bar_str = '▰' * progress + '▱' * (20 - progress)
+        
+        time_remaining = (total - current) / speed if speed > 0 else 0
+        time_str = time_formatter(time_remaining)
+        
+        try:
+            await message.edit(
+                f"{text}\n"
+                f"╞═{progress_bar_str}╡ {percentage:.2f}%\n"
+                f"**Size:** {humanbytes(current)} / {humanbytes(total)}\n"
+                f"**Speed:** {speed_string}\n"
+                f"**ETA:** {time_str}"
+            )
+        except MessageNotModifiedError:
+            pass
+
+
+def humanbytes(size):
+    """Convert bytes to human readable format"""
+    if not size:
+        return "0 B"
+    power = 2**10  # 1024
+    n = 0
+    units = {0: "B", 1: "KB", 2: "MB", 3: "GB", 4: "TB"}
+    while size > power:
+        size /= power
+        n += 1
+    return f"{size:.2f} {units[n]}"
+
+
+def time_formatter(seconds):
+    """Format seconds into readable time string"""
+    if seconds <= 0:
+        return "0s"
     
-    # Process timeout (in seconds)
-    PROCESS_TIMEOUT = 3600  # 1 hour
+    minutes, seconds = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
     
-    # Part duration (in seconds)
-    PART_DURATION = 60  # 1 minute
-    
-    # Chunk size for streaming download (50MB)
-    DOWNLOAD_CHUNK_SIZE = 50 * 1024 * 1024
-    
-    # Maximum compression attempts before giving up
-    MAX_COMPRESSION_ATTEMPTS = 3
-    
-    # FFmpeg path - handles Windows executable naming
-    if platform.system() == 'Windows':
-        FFMPEG_PATH = "ffmpeg.exe"
-        FFPROBE_PATH = "ffprobe.exe"
+    if hours > 0:
+        return f"{hours}h {minutes}m {seconds}s"
+    elif minutes > 0:
+        return f"{minutes}m {seconds}s"
     else:
-        FFMPEG_PATH = "ffmpeg"
-        FFPROBE_PATH = "ffprobe"
+        return f"{seconds}s"
 
-# Messages
-class Messages:
-    START = (
-        "👋 Welcome to Video Splitter Bot!\n\n"
-        "📹 Send me any video, and I'll split it into 1-minute parts.\n\n"
-        "🚀 Perfect for sharing long videos on Telegram without Premium!"
-    )
-    
-    HELP = (
-        "📖 *Video Splitter Bot Help*\n\n"
-        "This bot handles video files by:\n"
-        "1️⃣ Processing the video in 50MB chunks\n"
-        "2️⃣ Splitting each chunk into 1-minute segments\n"
-        "3️⃣ Compressing segments to fit Telegram's limit if needed\n"
-        "4️⃣ Sending each part with proper numbering\n\n"
-        "Commands:\n"
-        "/start - Start the bot\n"
-        "/help - Show this help message\n"
-        "/cancel - Cancel an ongoing process\n\n"
-        "⚠️ *Note:*\n"
-        "- Progress bars show real-time status\n"
-        "- You can cancel anytime with /cancel\n"
-        "- For best results, send MP4 or MKV format"
-    )
-    
-    DOWNLOADING = "⏳ Starting to process your video..."
-    DOWNLOAD_CHUNK = "⏳ Downloading chunk {}: {:.1f}MB of {:.1f}MB ({:.1f}%)"
-    PROCESSING = "🔄 Analyzing video chunk..."
-    SPLITTING = "✂️ Splitting this chunk into parts..."
-    CREATING_PART = "🔨 Creating part {} ... [{} of {}] {}"
-    COMPRESSING_PART = "🗜️ Part {} is too large. Compressing (attempt {})..."
-    UPLOADING_PART = "📤 Uploading part {} ... [{} of {}]"
-    PROCESS_SUCCESS = "✅ Done! All {} parts have been processed successfully."
-    PROCESS_TIMEOUT = "⏱️ Process timed out. Please try with a smaller video."
-    UNSUPPORTED_FORMAT = "❌ Please send a valid video file (MP4, MKV, MOV, etc)."
-    PROCESS_FAILED = "❌ Sorry, an error occurred while processing your video."
-    COMPRESSION_FAILED = "❌ Failed to compress part {} to fit Telegram's 50MB limit after multiple attempts."
-    CANCEL_PROCESS = "❌ Process cancelled."
-    OVERALL_PROGRESS = "\n\n🔄 Overall Progress: {:.1f}% complete"
-    FFMPEG_NOT_FOUND = "❌ FFmpeg not found. Please make sure FFmpeg is installed and in your system PATH."
-    CHECKING_FFMPEG = "🔍 Checking if FFmpeg is available..."
 
-# Custom progress bar
-def get_progress_bar(percentage, length=20):
-    filled_length = int(length * percentage / 100)
-    bar = '█' * filled_length + '░' * (length - filled_length)
-    return f"[{bar}] {percentage:.1f}%"
-
-# Custom exceptions
-class VideoProcessingError(Exception):
-    def __init__(self, user_message, admin_message=None):
-        self.user_message = user_message
-        self.admin_message = admin_message or user_message
-        super().__init__(self.user_message)
-
-class VideoProcessor:
-    def __init__(self, status_message, context):
-        self.status_message = status_message
-        self.context = context
-        self.temp_dir = tempfile.mkdtemp()
-        self.output_dir = tempfile.mkdtemp()
-        self.last_progress_update = 0
-        self.total_parts_sent = 0
-        self.estimated_total_parts = 0
-        self.total_chunks = 0
-        self.current_chunk = 0
+async def fast_download(file_path, message, client, progress_message):
+    """Download file with progress updates"""
+    progress_message.state = UserState()
+    progress_message.state.last_update_time = time.time()
     
-    async def cleanup(self):
-        """Clean up temporary directories"""
-        try:
-            shutil.rmtree(self.temp_dir, ignore_errors=True)
-            shutil.rmtree(self.output_dir, ignore_errors=True)
-        except Exception as e:
-            logger.error(f"Error cleaning up: {str(e)}")
-    
-    async def update_status(self, text, force=False):
-        """Update status message with rate limiting"""
-        try:
-            current_time = time.time()
-            if force or current_time - self.last_progress_update >= 1.5:  # Update every 1.5 seconds
-                await self.status_message.edit_text(text)
-                self.last_progress_update = current_time
-        except Exception as e:
-            logger.warning(f"Failed to update status: {str(e)}")
-    
-    async def check_ffmpeg(self):
-        """Check if FFmpeg is installed and available"""
-        await self.update_status(Messages.CHECKING_FFMPEG, force=True)
-        
-        try:
-            # Check FFmpeg
-            process = await asyncio.create_subprocess_exec(
-                Config.FFMPEG_PATH, "-version",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode != 0:
-                logger.error(f"FFmpeg not found: {stderr.decode() if stderr else 'No error output'}")
-                raise VideoProcessingError(Messages.FFMPEG_NOT_FOUND)
-                
-            # Check FFprobe
-            process = await asyncio.create_subprocess_exec(
-                Config.FFPROBE_PATH, "-version",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode != 0:
-                logger.error(f"FFprobe not found: {stderr.decode() if stderr else 'No error output'}")
-                raise VideoProcessingError(Messages.FFMPEG_NOT_FOUND)
-                
-        except FileNotFoundError:
-            logger.error("FFmpeg/FFprobe executables not found")
-            raise VideoProcessingError(Messages.FFMPEG_NOT_FOUND)
-    
-    async def run_subprocess(self, cmd, timeout=Config.PROCESS_TIMEOUT):
-        """Run a subprocess command with timeout and cancellation support"""
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            # Set up a task to check for cancellation
-            cancel_check_task = asyncio.create_task(self.check_cancellation(process))
-            
-            try:
-                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout)
-                cancel_check_task.cancel()
-                try:
-                    await cancel_check_task
-                except asyncio.CancelledError:
-                    pass
-                
-                return stdout, stderr, process.returncode
-            except asyncio.TimeoutError:
-                logger.error(f"Process timeout for command: {' '.join(cmd)}")
-                process.kill()
-                raise VideoProcessingError(Messages.PROCESS_TIMEOUT)
-                
-        except asyncio.CancelledError:
-            process.kill()
-            raise VideoProcessingError(Messages.CANCEL_PROCESS)
-    
-    async def check_cancellation(self, process):
-        """Check if process should be cancelled"""
-        while True:
-            await asyncio.sleep(1)
-            if not self.context.chat_data.get('active_process', True):
-                process.kill()
-                raise asyncio.CancelledError()
-    
-    async def get_video_duration(self, file):
-        """Get total video duration to estimate parts"""
-        try:
-            temp_file = os.path.join(self.temp_dir, "duration_check.mp4")
-            
-            # Download a small part of the video just to check duration
-            await file.download_to_drive(
-                custom_path=temp_file,
-                read_timeout=60,
-                write_timeout=60
-            )
-            
-            # Get duration using ffprobe
-            duration_cmd = [
-                Config.FFPROBE_PATH, 
-                "-v", "error", 
-                "-show_entries", "format=duration", 
-                "-of", "default=noprint_wrappers=1:nokey=1", 
-                temp_file
-            ]
-            
-            stdout, stderr, return_code = await self.run_subprocess(duration_cmd)
-            
-            if return_code != 0:
-                logger.warning(f"Couldn't get duration: {stderr.decode()}")
-                return None
-            
-            try:
-                duration = float(stdout.decode().strip())
-                self.estimated_total_parts = math.ceil(duration / Config.PART_DURATION)
-                return duration
-            except (ValueError, UnicodeDecodeError):
-                logger.warning("Error parsing duration")
-                return None
-                
-        except Exception as e:
-            logger.warning(f"Error getting video duration: {str(e)}")
-            return None
-    
-    async def download_chunk(self, file, offset, chunk_size, total_size, chunk_path):
-        """Download a specific chunk of the file"""
-        try:
-            # Calculate how much to download (handle last chunk)
-            size_to_download = min(chunk_size, total_size - offset)
-            
-            # Stream the download
-            downloaded = 0
-            
-            async with open(chunk_path, 'wb') as f:
-                async for data in await file.download_as_chunked_file(
-                    chunk_size=1024*1024,  # 1MB chunks for streaming
-                    offset=offset,
-                    limit=size_to_download
-                ):
-                    # Check if cancelled
-                    if not self.context.chat_data.get('active_process', True):
-                        raise VideoProcessingError(Messages.CANCEL_PROCESS)
-                    
-                    # Write data
-                    f.write(data)
-                    downloaded += len(data)
-                    
-                    # Update progress (MB values for user readability)
-                    progress = (downloaded / size_to_download) * 100
-                    progress_bar = get_progress_bar(progress)
-                    
-                    chunk_mb = (offset + downloaded) / (1024 * 1024)
-                    total_mb = total_size / (1024 * 1024)
-                    
-                    await self.update_status(
-                        f"{Messages.DOWNLOAD_CHUNK.format(self.current_chunk, chunk_mb, total_mb, progress)}\n"
-                        f"{progress_bar}"
-                        f"{Messages.OVERALL_PROGRESS.format((offset + downloaded) / total_size * 100)}"
-                    )
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error downloading chunk: {str(e)}")
-            return False
-    
-    async def get_video_info(self, file_path):
-        """Get video information using ffprobe"""
-        # Get duration
-        duration_cmd = [
-            Config.FFPROBE_PATH, 
-            "-v", "error", 
-            "-show_entries", "format=duration", 
-            "-of", "default=noprint_wrappers=1:nokey=1", 
-            file_path
-        ]
-        
-        stdout, stderr, return_code = await self.run_subprocess(duration_cmd)
-        
-        if return_code != 0:
-            logger.error(f"FFprobe error: {stderr.decode()}")
-            return {"duration": 60, "width": 640, "height": 360, "bitrate": None}
-        
-        try:
-            duration = float(stdout.decode().strip())
-        except (ValueError, UnicodeDecodeError):
-            duration = 60
-        
-        # Get dimensions
-        dimensions_cmd = [
-            Config.FFPROBE_PATH, 
-            "-v", "error", 
-            "-select_streams", "v:0", 
-            "-show_entries", "stream=width,height", 
-            "-of", "csv=s=x:p=0", 
-            file_path
-        ]
-        
-        stdout, stderr, return_code = await self.run_subprocess(dimensions_cmd)
-        
-        if return_code != 0 or not stdout:
-            width, height = 640, 360  # Default values
-        else:
-            try:
-                dimensions = stdout.decode().strip().split('x')
-                width = int(dimensions[0])
-                height = int(dimensions[1])
-            except (ValueError, IndexError, UnicodeDecodeError):
-                width, height = 640, 360  # Default values
-        
-        # Get bitrate
-        bitrate_cmd = [
-            Config.FFPROBE_PATH,
-            "-v", "error",
-            "-show_entries", "format=bit_rate",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            file_path
-        ]
-        
-        stdout, stderr, return_code = await self.run_subprocess(bitrate_cmd)
-        
-        if return_code != 0 or not stdout:
-            bitrate = None
-        else:
-            try:
-                bitrate = int(stdout.decode().strip())
-            except (ValueError, UnicodeDecodeError):
-                bitrate = None
-        
-        return {
-            "duration": duration,
-            "width": width,
-            "height": height,
-            "bitrate": bitrate
-        }
-    
-    async def process_chunk(self, chunk_path, start_time_global):
-        """Process a single chunk of the video"""
-        # Get info about this chunk
-        await self.update_status(Messages.PROCESSING)
-        video_info = await self.get_video_info(chunk_path)
-        
-        chunk_duration = video_info["duration"]
-        width = video_info["width"]
-        height = video_info["height"]
-        
-        # Calculate how many parts in this chunk
-        num_parts = math.ceil(chunk_duration / Config.PART_DURATION)
-        await self.update_status(Messages.SPLITTING)
-        
-        # Process each part
-        parts_processed = 0
-        for i in range(num_parts):
-            # Check if cancelled
-            if not self.context.chat_data.get('active_process', True):
-                raise VideoProcessingError(Messages.CANCEL_PROCESS)
-            
-            # Calculate times for this part
-            start_time_local = i * Config.PART_DURATION
-            end_time_local = min((i + 1) * Config.PART_DURATION, chunk_duration)
-            part_duration = end_time_local - start_time_local
-            
-            # Skip if part is too short (less than 1 second)
-            if part_duration < 1:
-                continue
-            
-            # Global part number for progress reporting
-            global_part_number = self.total_parts_sent + parts_processed + 1
-            
-            # Progress bar
-            progress = (i / num_parts) * 100
-            progress_bar = get_progress_bar(progress)
-            
-            # Update status
-            await self.update_status(
-                Messages.CREATING_PART.format(
-                    global_part_number, 
-                    self.current_chunk, 
-                    self.total_chunks,
-                    progress_bar
-                ) + Messages.OVERALL_PROGRESS.format(
-                    ((self.current_chunk - 1) / self.total_chunks * 100) + 
-                    (1 / self.total_chunks * progress)
-                )
-            )
-            
-            # Output path for this part
-            output_path = os.path.join(self.output_dir, f"part_{global_part_number}.mp4")
-            
-            # Convert start time to format for ffmpeg
-            start_str = str(timedelta(seconds=start_time_local)).split('.')[0]
-            
-            # Create the part with copy mode first for speed
-            split_cmd = [
-                Config.FFMPEG_PATH,
-                '-hide_banner',
-                '-ss', start_str,
-                '-i', chunk_path,
-                '-t', str(part_duration),
-                '-c', 'copy',
-                '-y',
-                output_path
-            ]
-            
-            stdout, stderr, return_code = await self.run_subprocess(split_cmd)
-            
-            # Check if the file was created successfully
-            if return_code != 0 or not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-                logger.error(f"Failed to create part {global_part_number}: {stderr.decode()}")
-                # Try again with re-encoding instead of copy
-                split_cmd = [
-                    Config.FFMPEG_PATH,
-                    '-hide_banner',
-                    '-ss', start_str,
-                    '-i', chunk_path,
-                    '-t', str(part_duration),
-                    '-c:v', 'libx264',
-                    '-preset', 'veryfast',
-                    '-c:a', 'aac',
-                    '-y',
-                    output_path
-                ]
-                
-                stdout, stderr, return_code = await self.run_subprocess(split_cmd)
-                
-                if return_code != 0 or not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-                    logger.error(f"Failed second attempt for part {global_part_number}: {stderr.decode()}")
-                    continue
-            
-            # Check file size and compress if needed
-            file_size = os.path.getsize(output_path)
-            original_size = file_size
-            
-            # If file is larger than Telegram's limit, try compressing
-            compression_attempt = 0
-            while file_size > Config.BOT_UPLOAD_LIMIT and compression_attempt < Config.MAX_COMPRESSION_ATTEMPTS:
-                compression_attempt += 1
-                
-                # Update status
-                await self.update_status(Messages.COMPRESSING_PART.format(global_part_number, compression_attempt))
-                
-                # Calculate target bitrate based on size
-                target_bitrate = int((Config.BOT_UPLOAD_LIMIT * 8 * 0.8) / part_duration)
-                
-                # Don't go too low
-                if target_bitrate < 100000:
-                    target_bitrate = 100000
-                
-                # Compressed output path
-                compressed_output = os.path.join(self.output_dir, f"comp_part_{global_part_number}_{compression_attempt}.mp4")
-                
-                # Compression settings - more aggressive with each attempt
-                crf = 23 + (compression_attempt * 5)
-                preset = "medium" if compression_attempt == 0 else "faster" if compression_attempt == 1 else "veryfast"
-                
-                # Scale down for more aggressive compression
-                scale_factor = 1.0
-                if compression_attempt > 1:
-                    scale_factor = 0.75 if compression_attempt == 2 else 0.5
-                
-                new_width = int(width * scale_factor)
-                new_height = int(height * scale_factor)
-                
-                # Make width and height even
-                new_width = new_width - (new_width % 2)
-                new_height = new_height - (new_height % 2)
-                
-                # Compression command
-                compress_cmd = [
-                    Config.FFMPEG_PATH,
-                    '-i', output_path,
-                    '-c:v', 'libx264',
-                    '-crf', str(crf),
-                    '-preset', preset,
-                    '-b:v', f"{target_bitrate}",
-                    '-maxrate', f"{target_bitrate * 1.5}",
-                    '-bufsize', f"{target_bitrate}",
-                ]
-                
-                # Add scaling if needed
-                if scale_factor < 1.0:
-                    compress_cmd.extend(['-vf', f'scale={new_width}:{new_height}'])
-                
-                # Audio settings
-                audio_bitrate = "96k" if compression_attempt > 1 else "128k"
-                compress_cmd.extend([
-                    '-c:a', 'aac',
-                    '-b:a', audio_bitrate,
-                    '-ac', '2',
-                    '-y',
-                    compressed_output
-                ])
-                
-                # Run compression
-                stdout, stderr, return_code = await self.run_subprocess(compress_cmd)
-                
-                # Check if compressed file was created
-                if return_code == 0 and os.path.exists(compressed_output) and os.path.getsize(compressed_output) > 0:
-                    # Update to compressed version
-                    old_output = output_path
-                    output_path = compressed_output
-                    file_size = os.path.getsize(output_path)
-                    
-                    # Clean up previous version if not original
-                    if "comp_part" in old_output:
-                        try:
-                            os.remove(old_output)
-                        except:
-                            pass
-                else:
-                    logger.error(f"Compression attempt {compression_attempt} failed for part {global_part_number}")
-            
-            # If still too large after compression
-            if file_size > Config.BOT_UPLOAD_LIMIT:
-                await self.update_status(Messages.COMPRESSION_FAILED.format(global_part_number))
-                continue
-            
-            # Prepare to send video
-            await self.update_status(
-                Messages.UPLOADING_PART.format(
-                    global_part_number, 
-                    self.current_chunk, 
-                    self.total_chunks
-                ) + Messages.OVERALL_PROGRESS.format(
-                    ((self.current_chunk - 1) / self.total_chunks * 100) + 
-                    (1 / self.total_chunks * progress)
-                )
-            )
-            
-            # Format global timestamp for caption (start time since beginning of video)
-            global_timestamp = str(timedelta(seconds=start_time_global + start_time_local)).split('.')[0]
-            
-            # Compression info for caption
-            compression_info = ""
-            if "comp_part" in output_path:
-                compression_ratio = (1 - (file_size / original_size)) * 100
-                compression_info = f"\n💾 Compressed: {file_size / 1024 / 1024:.1f}MB ({compression_ratio:.1f}% reduction)"
-            
-            # Send the video part
-            try:
-                with open(output_path, 'rb') as video_file:
-                    # Send with appropriate caption
-                    await self.status_message.reply_video(
-                        video=video_file,
-                        caption=f"Part {global_part_number} [Time: {global_timestamp}]{compression_info}",
-                        width=width,
-                        height=height,
-                        duration=int(part_duration),
-                        supports_streaming=True
-                    )
-                
-                parts_processed += 1
-                
-                # Clean up part to save space
-                try:
-                    os.remove(output_path)
-                except:
-                    pass
-                    
-            except Exception as e:
-                logger.error(f"Error sending part {global_part_number}: {str(e)}")
-                await self.update_status(f"❌ Failed to send part {global_part_number}")
-        
-        # Return number of parts successfully processed
-        return parts_processed
-    
-    async def process_video_in_chunks(self, file, file_size):
-        """Process a video in 50MB chunks"""
-        # First, check if FFmpeg is installed
-        await self.check_ffmpeg()
-        
-        # Try to get total duration to estimate parts
-        total_duration = await self.get_video_duration(file)
-        
-        # Calculate number of chunks needed
-        self.total_chunks = math.ceil(file_size / Config.DOWNLOAD_CHUNK_SIZE)
-        
-        # Process each chunk
-        offset = 0
-        start_time_offset = 0
-        
-        for chunk_index in range(self.total_chunks):
-            # Check if canceled
-            if not self.context.chat_data.get('active_process', True):
-                raise VideoProcessingError(Messages.CANCEL_PROCESS)
-            
-            self.current_chunk = chunk_index + 1
-            
-            # Chunk path
-            chunk_path = os.path.join(self.temp_dir, f"chunk_{chunk_index}.mp4")
-            
-            # Download this chunk
-            success = await self.download_chunk(
-                file, offset, Config.DOWNLOAD_CHUNK_SIZE, file_size, chunk_path
-            )
-            
-            if not success:
-                logger.error(f"Failed to download chunk {chunk_index}")
-                continue
-            
-            # Process this chunk
-            parts_in_chunk = await self.process_chunk(chunk_path, start_time_offset)
-            
-            # Update counters
-            self.total_parts_sent += parts_in_chunk
-            
-            # Get info for this chunk to calculate next start time
-            chunk_info = await self.get_video_info(chunk_path)
-            start_time_offset += chunk_info["duration"]
-            
-            # Clean up chunk file
-            try:
-                os.remove(chunk_path)
-            except:
-                pass
-            
-            # Move to next chunk
-            offset += Config.DOWNLOAD_CHUNK_SIZE
-            
-            # Stop if we've reached end of file
-            if offset >= file_size:
-                break
-        
-        # Final success message
-        if self.total_parts_sent > 0:
-            await self.status_message.edit_text(Messages.PROCESS_SUCCESS.format(self.total_parts_sent))
-        else:
-            raise VideoProcessingError(Messages.PROCESS_FAILED)
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a message when the command /start is issued."""
-    await update.message.reply_text(Messages.START)
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a message when the command /help is issued."""
-    await update.message.reply_text(Messages.HELP, parse_mode='Markdown')
-
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Cancel the current operation."""
-    if context.chat_data.get('active_process', False):
-        context.chat_data['active_process'] = False
-        await update.message.reply_text(Messages.CANCEL_PROCESS)
-    else:
-        await update.message.reply_text("No active process to cancel.")
-
-async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Process the video sent by the user."""
-    # Check if the message contains a video or video document
-    if not update.message.video and not update.message.document:
-        await update.message.reply_text(Messages.UNSUPPORTED_FORMAT)
-        return
-    
-    # Check if document is actually a video
-    if update.message.document:
-        mime_type = update.message.document.mime_type
-        if not mime_type or not mime_type.startswith('video/'):
-            await update.message.reply_text(Messages.UNSUPPORTED_FORMAT)
-            return
-    
-    # Check if already processing
-    if context.chat_data.get('active_process', False):
-        await update.message.reply_text("⚠️ I'm already processing a video. Please wait or use /cancel to stop the current operation.")
-        return
-    
-    # Set active process flag
-    context.chat_data['active_process'] = True
-    
-    # Status message
-    status_message = await update.message.reply_text(Messages.DOWNLOADING)
-    
-    # Create processor
-    processor = VideoProcessor(status_message, context)
+    start_time = time.time()
     
     try:
-        # Get file info
-        if update.message.video:
-            file = await update.message.video.get_file()
-            file_size = update.message.video.file_size
-        else:
-            file = await update.message.document.get_file()
-            file_size = update.message.document.file_size
-        
-        # Process video in chunks
-        await processor.process_video_in_chunks(file, file_size)
-        
-    except VideoProcessingError as e:
-        await status_message.edit_text(e.user_message)
+        downloaded_file = await client.download_media(
+            message=message,
+            file=file_path,
+            progress_callback=lambda current, total: asyncio.create_task(
+                progress_bar(current, total, progress_message, start_time, "**DOWNLOADING:**")
+            )
+        )
+        return downloaded_file
     except Exception as e:
-        logger.error(f"Error processing video: {str(e)}", exc_info=True)
-        await status_message.edit_text(
-            f"{Messages.PROCESS_FAILED}\n\nError: {escape_markdown(str(e)[:100], version=2)}\n\nPlease try with a different video."
+        print(f"Download error: {e}")
+        raise e
+
+
+async def fast_upload(file_path, client, progress_message, caption):
+    """Upload file with progress updates"""
+    progress_message.state = UserState()
+    progress_message.state.last_update_time = time.time()
+    
+    start_time = time.time()
+    file_name = os.path.basename(file_path)
+    
+    try:
+        if file_path.endswith(('.mp4', '.mkv', '.webm', '.avi')):
+            # Get video metadata
+            metadata = await get_video_metadata(file_path)
+            width = metadata.get("width", 0)
+            height = metadata.get("height", 0)
+            duration = metadata.get("duration", 0)
+            
+            # For video files
+            uploaded_file = await client.send_file(
+                progress_message.chat_id,
+                file=file_path,
+                caption=caption,
+                supports_streaming=True,
+                thumb=THUMBNAIL_PATH if THUMBNAIL_PATH and os.path.exists(THUMBNAIL_PATH) and os.path.getsize(THUMBNAIL_PATH) > 0 else None,
+                attributes=[DocumentAttributeVideo(
+                    duration=int(duration),
+                    w=width,
+                    h=height,
+                    supports_streaming=True
+                )],
+                progress_callback=lambda current, total: asyncio.create_task(
+                    progress_bar(current, total, progress_message, start_time, "**UPLOADING:**")
+                )
+            )
+        else:
+            # For non-video files
+            uploaded_file = await client.send_file(
+                progress_message.chat_id,
+                file=file_path,
+                caption=caption,
+                thumb=THUMBNAIL_PATH if THUMBNAIL_PATH and os.path.exists(THUMBNAIL_PATH) and os.path.getsize(THUMBNAIL_PATH) > 0 else None,
+                force_document=True,
+                progress_callback=lambda current, total: asyncio.create_task(
+                    progress_bar(current, total, progress_message, start_time, "**UPLOADING:**")
+                )
+            )
+        return uploaded_file
+    except Exception as e:
+        print(f"Upload error: {e}")
+        raise e
+
+
+async def get_video_metadata(file_path):
+    """Get video metadata using ffprobe"""
+    try:
+        import subprocess
+        import json
+
+        cmd = [
+            "ffprobe", "-v", "quiet", "-print_format", "json", 
+            "-show_format", "-show_streams", file_path
+        ]
+        
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        output, error = process.communicate()
+        
+        if process.returncode != 0:
+            print(f"Error getting metadata: {error.decode()}")
+            return {"width": 0, "height": 0, "duration": 0}
+        
+        metadata = json.loads(output.decode())
+        
+        # Find video stream
+        video_stream = None
+        for stream in metadata.get("streams", []):
+            if stream.get("codec_type") == "video":
+                video_stream = stream
+                break
+        
+        if not video_stream:
+            return {"width": 0, "height": 0, "duration": 0}
+        
+        width = int(video_stream.get("width", 0))
+        height = int(video_stream.get("height", 0))
+        
+        # Get duration
+        duration = float(video_stream.get("duration", 0))
+        if duration == 0:
+            duration = float(metadata.get("format", {}).get("duration", 0))
+        
+        return {
+            "width": width,
+            "height": height,
+            "duration": duration
+        }
+    except Exception as e:
+        print(f"Error in get_video_metadata: {e}")
+        return {"width": 0, "height": 0, "duration": 0}
+
+
+async def execute_ffmpeg(input_file, output_file, start_time, end_time):
+    """Execute ffmpeg command to trim video"""
+    try:
+        # Make sure ffmpeg is installed and in PATH
+        import shutil
+        if not shutil.which("ffmpeg"):
+            print("FFmpeg not found! Please install FFmpeg and make sure it's in your PATH.")
+            raise Exception("FFmpeg not installed or not in PATH")
+        
+        # Check if input file exists
+        if not os.path.exists(input_file):
+            print(f"Input file does not exist: {input_file}")
+            raise Exception(f"Input file not found: {input_file}")
+            
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        
+        # Create ffmpeg command
+        cmd = [
+            "ffmpeg", "-i", input_file, "-ss", start_time, 
+            "-to", end_time, "-c:v", "copy", "-c:a", "copy", 
+            "-avoid_negative_ts", "make_zero", output_file, 
+            "-y"
+        ]
+        
+        print(f"Executing FFmpeg command: {' '.join(cmd)}")
+        
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await process.communicate()
+        
+        if process.returncode != 0:
+            print(f"FFmpeg error: {stderr.decode() if stderr else 'Unknown error'}")
+            raise Exception(f"FFmpeg failed with code {process.returncode}")
+        
+        # Verify output file was created
+        if not os.path.exists(output_file):
+            print(f"Output file was not created: {output_file}")
+            raise Exception("Output file was not created")
+            
+        return output_file
+    except Exception as e:
+        print(f"Error in execute_ffmpeg: {e}")
+        raise e
+
+
+# New function for splitting a video into segments
+async def split_video_into_segments(input_file, output_pattern, segment_duration):
+    """Split video into segments of equal duration using ffmpeg"""
+    try:
+        # Make sure ffmpeg is installed
+        import shutil
+        if not shutil.which("ffmpeg"):
+            print("FFmpeg not found! Please install FFmpeg and make sure it's in your PATH.")
+            raise Exception("FFmpeg not installed or not in PATH")
+        
+        # Check if input file exists
+        if not os.path.exists(input_file):
+            print(f"Input file does not exist: {input_file}")
+            raise Exception(f"Input file not found: {input_file}")
+            
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(output_pattern), exist_ok=True)
+        
+        # Create ffmpeg command for segmenting
+        cmd = [
+            "ffmpeg", "-i", input_file, 
+            "-c", "copy", "-map", "0",
+            "-segment_time", str(segment_duration), 
+            "-f", "segment", "-reset_timestamps", "1",
+            output_pattern, "-y"
+        ]
+        
+        print(f"Executing FFmpeg segment command: {' '.join(cmd)}")
+        
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await process.communicate()
+        
+        if process.returncode != 0:
+            print(f"FFmpeg segment error: {stderr.decode() if stderr else 'Unknown error'}")
+            raise Exception(f"FFmpeg segmentation failed with code {process.returncode}")
+            
+        # List of generated segment files
+        import glob
+        segment_files = sorted(glob.glob(output_pattern.replace("%03d", "*")))
+        
+        if not segment_files:
+            print(f"No segment files were created with pattern: {output_pattern}")
+            raise Exception("No segment files were created")
+            
+        return segment_files
+    except Exception as e:
+        print(f"Error in split_video_into_segments: {e}")
+        raise e
+
+
+# Bot event handlers
+@bot.on(events.NewMessage(pattern='/start'))
+async def start_handler(event):
+    """Handle /start command"""
+    user = await event.get_sender()
+    username = get_display_name(user)
+    
+    welcome_text = (
+        f"👋 Hello {username}!\n\n"
+        f"I'm **Video Trimmer Pro Bot** - I can help you trim your videos easily.\n\n"
+        f"Just send me a video file, and I'll guide you through the trimming process.\n\n"
+        f"**Features:**\n"
+        f"• Trim videos to specific time segments\n"
+        f"• Split videos into 1-minute parts\n"
+        f"• Maintains original video quality\n"
+        f"• Supports multiple video formats\n"
+        f"• Real-time progress updates\n\n"
+        f"Send a video to get started!"
+    )
+    
+    # Fixed: Using only inline buttons
+    buttons = [
+        [Button.url("Support Channel", SUPPORT_LINK)],
+        [Button.inline("How to use", b"how_to_use")]
+    ]
+    
+    await event.respond(welcome_text, buttons=buttons)
+
+
+@bot.on(events.CallbackQuery(data=b"how_to_use"))
+async def how_to_use_handler(event):
+    """Handle how to use button click"""
+    instructions = (
+        "**How to Use Video Trimmer Bot:**\n\n"
+        "1. Send any video file to the bot\n"
+        "2. Choose an operation mode:\n"
+        "   • **Trim Mode:** Trim video between specific times\n"
+        "   • **Split Mode:** Split video into 1-minute segments\n\n"
+        "**For Trim Mode:**\n"
+        "Enter the start and end times in format: `mm:ss` or `hh:mm:ss`\n"
+        "Example: `00:30 02:15`\n\n"
+        "**For Split Mode:**\n"
+        "The bot will automatically split your video into 1-minute segments and send them to you."
+    )
+    
+    await event.answer()
+    await event.respond(instructions)
+
+
+@bot.on(events.NewMessage(func=lambda e: e.media))
+async def media_handler(event):
+    """Handle incoming media files"""
+    user_id = event.sender_id
+    
+    # Check if media is video
+    if hasattr(event.media, "document"):
+        mime_type = event.media.document.mime_type
+        is_video = mime_type and ("video" in mime_type)
+    else:
+        is_video = bool(event.video)
+    
+    if not is_video:
+        await event.respond("Please send a video file to trim or split.")
+        return
+    
+    # Initialize user state
+    if user_id not in user_states:
+        user_states[user_id] = UserState()
+    
+    user_states[user_id].original_message = event.message
+    
+    # Get video duration
+    duration = 0
+    if hasattr(event.media, "document") and hasattr(event.media.document, "attributes"):
+        for attr in event.media.document.attributes:
+            if isinstance(attr, DocumentAttributeVideo):
+                duration = attr.duration
+                break
+    
+    # Format duration
+    hours, remainder = divmod(duration, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    duration_str = f"{hours:02}:{minutes:02}:{seconds:02}" if hours else f"{minutes:02}:{seconds:02}"
+    
+    # Create buttons for operation mode
+    buttons = [
+        [
+            Button.inline("✂️ Trim Video", b"mode_trim"),
+            Button.inline("🪓 Split into 1-Min Parts", b"mode_split")
+        ]
+    ]
+    
+    instructions = (
+        f"**Video received!**\n\n"
+        f"Video duration: `{duration_str}`\n\n"
+        f"Please select what you want to do with this video:"
+    )
+    
+    await event.respond(instructions, buttons=buttons)
+
+
+@bot.on(events.CallbackQuery(data=b"mode_trim"))
+async def trim_mode_handler(event):
+    """Handle selection of trim mode"""
+    user_id = event.sender_id
+    
+    # Check if user has an active video
+    if user_id not in user_states or not user_states[user_id].original_message:
+        await event.answer("Please send a video first!", alert=True)
+        return
+    
+    # Get video duration
+    duration = 0
+    original_message = user_states[user_id].original_message
+    if hasattr(original_message.media, "document") and hasattr(original_message.media.document, "attributes"):
+        for attr in original_message.media.document.attributes:
+            if isinstance(attr, DocumentAttributeVideo):
+                duration = attr.duration
+                break
+    
+    # Format duration
+    hours, remainder = divmod(duration, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    duration_str = f"{hours:02}:{minutes:02}:{seconds:02}" if hours else f"{minutes:02}:{seconds:02}"
+    
+    instructions = (
+        f"**✂️ TRIM MODE Selected**\n\n"
+        f"Video duration: `{duration_str}`\n\n"
+        f"Please reply with start and end times in format:\n"
+        f"`start_time end_time`\n\n"
+        f"Example: `00:30 02:15`\n"
+        f"(This trims from 30 seconds to 2 minutes 15 seconds)"
+    )
+    
+    await event.answer()
+    await event.edit(instructions)
+
+
+@bot.on(events.CallbackQuery(data=b"mode_split"))
+async def split_mode_handler(event):
+    """Handle selection of split mode"""
+    user_id = event.sender_id
+    
+    # Check if user has an active video
+    if user_id not in user_states or not user_states[user_id].original_message:
+        await event.answer("Please send a video first!", alert=True)
+        return
+    
+    await event.answer("Starting split operation...")
+    
+    # Create confirmation message with warning about large videos
+    confirmation = (
+        "**🪓 SPLIT MODE Selected**\n\n"
+        "This will split your video into 1-minute segments.\n\n"
+        "⚠️ **Warning:** For large videos, this may produce many files.\n\n"
+        "Do you want to proceed?"
+    )
+    
+    buttons = [
+        [
+            Button.inline("✅ Yes, split my video", b"confirm_split"),
+            Button.inline("❌ Cancel", b"cancel_split")
+        ]
+    ]
+    
+    await event.edit(confirmation, buttons=buttons)
+
+
+@bot.on(events.CallbackQuery(data=b"confirm_split"))
+async def confirm_split_handler(event):
+    """Handle confirmation of split operation"""
+    user_id = event.sender_id
+    
+    # Check if user has an active video
+    if user_id not in user_states or not user_states[user_id].original_message:
+        await event.answer("Please send a video first!", alert=True)
+        return
+    
+    await event.answer("Starting split operation...")
+    
+    # Update message to show progress
+    progress_message = await event.edit("**Initializing split operation...**")
+    
+    # Start the splitting process
+    await split_video(progress_message, user_states[user_id].original_message)
+
+
+@bot.on(events.CallbackQuery(data=b"cancel_split"))
+async def cancel_split_handler(event):
+    """Handle cancellation of split operation"""
+    await event.answer("Operation cancelled.")
+    
+    await event.edit(
+        "**Operation cancelled.**\n\n"
+        "Send another video or use /start to restart."
+    )
+
+
+@bot.on(events.NewMessage(func=lambda e: not e.media and not e.text.startswith('/')))
+async def trim_command_handler(event):
+    """Handle trim time inputs"""
+    user_id = event.sender_id
+    text = event.text.strip()
+    
+    # Check if user has an active video
+    if user_id not in user_states or not user_states[user_id].original_message:
+        await event.respond("Please send a video first!")
+        return
+    
+    # Try to parse start and end times
+    try:
+        parts = text.split()
+        if len(parts) != 2:
+            raise ValueError("Invalid format")
+        
+        start_time = parts[0]
+        end_time = parts[1]
+        
+        # Validate time format
+        for time_str in (start_time, end_time):
+            if ":" not in time_str:
+                raise ValueError("Invalid time format")
+            
+            time_parts = time_str.split(":")
+            if len(time_parts) not in (2, 3):
+                raise ValueError("Invalid time format")
+            
+            for part in time_parts:
+                if not part.isdigit():
+                    raise ValueError("Time must contain only digits")
+        
+        # Start trimming process
+        await trim_video(event, user_states[user_id].original_message, start_time, end_time)
+    except ValueError as e:
+        await event.respond(
+            f"❌ **Error:** {str(e)}\n\n"
+            f"Please use the format: `start_time end_time`\n"
+            f"Example: `00:30 02:15`"
+        )
+
+
+async def trim_video(event, original_message, start_time, end_time):
+    """Process video trimming"""
+    user_id = event.sender_id
+    
+    # Create unique filenames
+    timestamp = dt.now().strftime("%Y%m%d_%H%M%S")
+    input_file = os.path.abspath(f"downloads/input_{user_id}_{timestamp}")
+    output_file = os.path.abspath(f"processed/trimmed_{user_id}_{timestamp}")
+    
+    # Determine file extension
+    if hasattr(original_message.media, "document"):
+        mime_type = original_message.media.document.mime_type
+        if "mp4" in mime_type:
+            input_file += ".mp4"
+            output_file += ".mp4"
+        elif "x-matroska" in mime_type:
+            input_file += ".mkv"
+            output_file += ".mkv"
+        elif "webm" in mime_type:
+            input_file += ".webm"
+            output_file += ".webm"
+        else:
+            # Try to get the file extension from the name
+            if hasattr(original_message.media.document, "attributes"):
+                for attr in original_message.media.document.attributes:
+                    if hasattr(attr, "file_name") and attr.file_name:
+                        if "." in attr.file_name:
+                            ext = attr.file_name.split(".")[-1]
+                            input_file += f".{ext}"
+                            output_file += f".{ext}"
+                            break
+            
+            # Default to mp4 if we couldn't determine the extension
+            if not "." in input_file:
+                input_file += ".mp4"
+                output_file += ".mp4"
+    else:
+        input_file += ".mp4"
+        output_file += ".mp4"
+    
+    # Ensure directories exist
+    os.makedirs(os.path.dirname(input_file), exist_ok=True)
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    
+    # Send initial progress message
+    progress_message = await event.respond("**Initializing trim operation...**")
+    
+    try:
+        # Download the video
+        await progress_message.edit("**Preparing to download...**")
+        await fast_download(input_file, original_message, bot, progress_message)
+        
+        # Check if file exists after download
+        if not os.path.exists(input_file):
+            await progress_message.edit("❌ **Download failed. File not found.**")
+            return
+            
+        # Process the video
+        await progress_message.edit(
+            f"**Trimming video from `{start_time}` to `{end_time}`...**\n"
+            f"This may take some time depending on the video size."
+        )
+        
+        try:
+            await execute_ffmpeg(input_file, output_file, start_time, end_time)
+        except Exception as e:
+            await progress_message.edit(f"❌ **Trimming failed:** {str(e)}")
+            # Clean up
+            if os.path.exists(input_file):
+                try:
+                    os.remove(input_file)
+                except:
+                    pass
+            return
+        
+        # Upload the trimmed video
+        caption = (
+            f"**✂️ TRIMMED VIDEO**\n"
+            f"⏱️ From: `{start_time}` To: `{end_time}`\n"
+            f"🤖 Trimmed by @{BOT_UN}"
+        )
+        
+        try:
+            await fast_upload(output_file, bot, progress_message, caption)
+            await progress_message.edit("**✅ Video trimmed and uploaded successfully!**")
+        except Exception as e:
+            await progress_message.edit(f"❌ **Upload failed:** {str(e)}\n\nPlease try again or contact support.")
+    except Exception as e:
+        await progress_message.edit(
+            f"❌ **An error occurred:**\n`{str(e)}`\n\n"
+            f"Please try again or contact [support]({SUPPORT_LINK}).",
+            link_preview=False
         )
     finally:
         # Clean up
-        context.chat_data['active_process'] = False
-        await processor.cleanup()
+        if os.path.exists(input_file):
+            try:
+                os.remove(input_file)
+            except:
+                pass
+        if os.path.exists(output_file):
+            try:
+                os.remove(output_file)
+            except:
+                pass
 
-def main() -> None:
-    """Start the bot."""
-    # Create the Application
-    application = Application.builder().token(TOKEN).build()
 
-    # Add handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("cancel", cancel_command))
-    application.add_handler(MessageHandler(filters.VIDEO | filters.Document.ALL, process_video))
+async def split_video(progress_message, original_message):
+    """Process video splitting into 1-minute segments"""
+    user_id = progress_message.sender_id if hasattr(progress_message, "sender_id") else 0
+    
+    # Create unique filenames
+    timestamp = dt.now().strftime("%Y%m%d_%H%M%S")
+    input_file = os.path.abspath(f"downloads/input_{user_id}_{timestamp}")
+    output_pattern = os.path.abspath(f"processed/split_{user_id}_{timestamp}_%03d")
+    
+    # Determine file extension
+    if hasattr(original_message.media, "document"):
+        mime_type = original_message.media.document.mime_type
+        if "mp4" in mime_type:
+            input_file += ".mp4"
+            output_pattern += ".mp4"
+        elif "x-matroska" in mime_type:
+            input_file += ".mkv"
+            output_pattern += ".mkv"
+        elif "webm" in mime_type:
+            input_file += ".webm"
+            output_pattern += ".webm"
+        else:
+            # Try to get the file extension from the name
+            if hasattr(original_message.media.document, "attributes"):
+                for attr in original_message.media.document.attributes:
+                    if hasattr(attr, "file_name") and attr.file_name:
+                        if "." in attr.file_name:
+                            ext = attr.file_name.split(".")[-1]
+                            input_file += f".{ext}"
+                            output_pattern += f".{ext}"
+                            break
+            
+            # Default to mp4 if we couldn't determine the extension
+            if not "." in input_file:
+                input_file += ".mp4"
+                output_pattern += ".mp4"
+    else:
+        input_file += ".mp4"
+        output_pattern += ".mp4"
+    
+    # Ensure directories exist
+    os.makedirs(os.path.dirname(input_file), exist_ok=True)
+    os.makedirs(os.path.dirname(output_pattern), exist_ok=True)
+    
+    try:
+        # Download the video
+        await progress_message.edit("**Preparing to download...**")
+        await fast_download(input_file, original_message, bot, progress_message)
+        
+        # Check if file exists after download
+        if not os.path.exists(input_file):
+            await progress_message.edit("❌ **Download failed. File not found.**")
+            return
+            
+        # Get video duration for estimation
+        metadata = await get_video_metadata(input_file)
+        duration = metadata.get("duration", 0)
+        estimated_parts = math.ceil(duration / 60)
+        
+        # Process the video
+        await progress_message.edit(
+            f"**Splitting video into 1-minute segments...**\n"
+            f"Estimated number of parts: **{estimated_parts}**\n"
+            f"This may take some time depending on the video size."
+        )
+        
+        try:
+            # Set segment duration to 60 seconds (1 minute)
+            segment_files = await split_video_into_segments(input_file, output_pattern, 60)
+            total_segments = len(segment_files)
+            
+            await progress_message.edit(
+                f"**🎬 Video split into {total_segments} parts**\n"
+                f"Starting upload of all segments..."
+            )
+            
+            # Upload each segment
+            for i, segment_file in enumerate(segment_files, 1):
+                # Update progress
+                await progress_message.edit(
+                    f"**Uploading segment {i}/{total_segments}...**"
+                )
+                
+                # Prepare caption
+                caption = (
+                    f"**🪓 SPLIT VIDEO - PART {i}/{total_segments}**\n"
+                    f"⏱️ Duration: ~1 minute\n"
+                    f"🤖 Split by @{BOT_UN}"
+                )
+                
+                # Upload the segment
+                try:
+                    await fast_upload(segment_file, bot, progress_message, caption)
+                except Exception as e:
+                    await progress_message.edit(f"❌ **Failed to upload part {i}:** {str(e)}")
+                    continue
+                
+                # Delete the segment file after upload
+                try:
+                    os.remove(segment_file)
+                except:
+                    pass
+            
+            await progress_message.edit("**✅ Video split and all parts uploaded successfully!**")
+        except Exception as e:
+            await progress_message.edit(f"❌ **Splitting failed:** {str(e)}")
+    except Exception as e:
+        await progress_message.edit(
+            f"❌ **An error occurred:**\n`{str(e)}`\n\n"
+            f"Please try again or contact [support]({SUPPORT_LINK}).",
+            link_preview=False
+        )
+    finally:
+        # Clean up
+        if os.path.exists(input_file):
+            try:
+                os.remove(input_file)
+            except:
+                pass
+        
+        # Clean up any remaining segment files
+        import glob
+        segment_files = glob.glob(output_pattern.replace("%03d", "*"))
+        for file in segment_files:
+            try:
+                os.remove(file)
+            except:
+                pass
 
-    # Run the bot until the user presses Ctrl-C
-    application.run_polling()
 
+# Additional function to handle custom split durations
+@bot.on(events.CallbackQuery(data=b"custom_split"))
+async def custom_split_handler(event):
+    """Handle request for custom split duration"""
+    user_id = event.sender_id
+    
+    # Check if user has an active video
+    if user_id not in user_states or not user_states[user_id].original_message:
+        await event.answer("Please send a video first!", alert=True)
+        return
+    
+    await event.answer()
+    
+    instructions = (
+        "**🪓 CUSTOM SPLIT DURATION**\n\n"
+        "Please enter the duration (in seconds) for each segment.\n\n"
+        "Example: Enter `120` for 2-minute segments.\n\n"
+        "Recommended values: 30-300 seconds."
+    )
+    
+    await event.edit(instructions)
+    
+    # Update user state to indicate waiting for custom duration
+    user_states[user_id].waiting_for_custom_duration = True
+
+
+@bot.on(events.NewMessage(func=lambda e: not e.media and e.text.isdigit()))
+async def custom_duration_handler(event):
+    """Handle custom duration input for video splitting"""
+    user_id = event.sender_id
+    
+    # Check if user has an active video and is waiting for custom duration
+    if (user_id not in user_states or 
+        not user_states[user_id].original_message or 
+        not getattr(user_states[user_id], 'waiting_for_custom_duration', False)):
+        return
+    
+    # Get the duration in seconds
+    try:
+        duration = int(event.text.strip())
+        
+        if duration < 5 or duration > 600:
+            await event.respond(
+                "⚠️ **Invalid duration!**\n\n"
+                "Please enter a value between 5 and 600 seconds."
+            )
+            return
+        
+        # Reset the waiting state
+        user_states[user_id].waiting_for_custom_duration = False
+        
+        # Start the custom splitting process
+        progress_message = await event.respond(f"**Starting split with {duration} second segments...**")
+        await split_video_custom_duration(progress_message, user_states[user_id].original_message, duration)
+    except ValueError:
+        await event.respond("Please enter a valid number of seconds.")
+
+
+async def split_video_custom_duration(progress_message, original_message, segment_duration):
+    """Process video splitting into segments of custom duration"""
+    user_id = progress_message.sender_id if hasattr(progress_message, "sender_id") else 0
+    
+    # Create unique filenames
+    timestamp = dt.now().strftime("%Y%m%d_%H%M%S")
+    input_file = os.path.abspath(f"downloads/input_{user_id}_{timestamp}")
+    output_pattern = os.path.abspath(f"processed/split_{user_id}_{timestamp}_%03d")
+    
+    # Determine file extension (same code as in split_video function)
+    if hasattr(original_message.media, "document"):
+        mime_type = original_message.media.document.mime_type
+        if "mp4" in mime_type:
+            input_file += ".mp4"
+            output_pattern += ".mp4"
+        elif "x-matroska" in mime_type:
+            input_file += ".mkv"
+            output_pattern += ".mkv"
+        elif "webm" in mime_type:
+            input_file += ".webm"
+            output_pattern += ".webm"
+        else:
+            # Try to get the file extension from the name
+            if hasattr(original_message.media.document, "attributes"):
+                for attr in original_message.media.document.attributes:
+                    if hasattr(attr, "file_name") and attr.file_name:
+                        if "." in attr.file_name:
+                            ext = attr.file_name.split(".")[-1]
+                            input_file += f".{ext}"
+                            output_pattern += f".{ext}"
+                            break
+            
+            # Default to mp4 if we couldn't determine the extension
+            if not "." in input_file:
+                input_file += ".mp4"
+                output_pattern += ".mp4"
+    else:
+        input_file += ".mp4"
+        output_pattern += ".mp4"
+    
+    # Ensure directories exist
+    os.makedirs(os.path.dirname(input_file), exist_ok=True)
+    os.makedirs(os.path.dirname(output_pattern), exist_ok=True)
+    
+    try:
+        # Download the video
+        await progress_message.edit("**Preparing to download...**")
+        await fast_download(input_file, original_message, bot, progress_message)
+        
+        # Check if file exists after download
+        if not os.path.exists(input_file):
+            await progress_message.edit("❌ **Download failed. File not found.**")
+            return
+            
+        # Get video duration for estimation
+        metadata = await get_video_metadata(input_file)
+        duration = metadata.get("duration", 0)
+        estimated_parts = math.ceil(duration / segment_duration)
+        
+        # Format segment duration for display
+        if segment_duration >= 60:
+            minutes = segment_duration // 60
+            seconds = segment_duration % 60
+            duration_str = f"{minutes} minute{'s' if minutes > 1 else ''}"
+            if seconds > 0:
+                duration_str += f" {seconds} second{'s' if seconds > 1 else ''}"
+        else:
+            duration_str = f"{segment_duration} second{'s' if segment_duration > 1 else ''}"
+        
+        # Process the video
+        await progress_message.edit(
+            f"**Splitting video into {duration_str} segments...**\n"
+            f"Estimated number of parts: **{estimated_parts}**\n"
+            f"This may take some time depending on the video size."
+        )
+        
+        try:
+            # Use the custom segment duration
+            segment_files = await split_video_into_segments(input_file, output_pattern, segment_duration)
+            total_segments = len(segment_files)
+            
+            await progress_message.edit(
+                f"**🎬 Video split into {total_segments} parts**\n"
+                f"Starting upload of all segments..."
+            )
+            
+            # Upload each segment
+            for i, segment_file in enumerate(segment_files, 1):
+                # Update progress
+                await progress_message.edit(
+                    f"**Uploading segment {i}/{total_segments}...**"
+                )
+                
+                # Prepare caption
+                caption = (
+                    f"**🪓 SPLIT VIDEO - PART {i}/{total_segments}**\n"
+                    f"⏱️ Duration: ~{duration_str}\n"
+                    f"🤖 Split by @{BOT_UN}"
+                )
+                
+                # Upload the segment
+                try:
+                    await fast_upload(segment_file, bot, progress_message, caption)
+                except Exception as e:
+                    await progress_message.edit(f"❌ **Failed to upload part {i}:** {str(e)}")
+                    continue
+                
+                # Delete the segment file after upload
+                try:
+                    os.remove(segment_file)
+                except:
+                    pass
+            
+            await progress_message.edit("**✅ Video split and all parts uploaded successfully!**")
+        except Exception as e:
+            await progress_message.edit(f"❌ **Splitting failed:** {str(e)}")
+    except Exception as e:
+        await progress_message.edit(
+            f"❌ **An error occurred:**\n`{str(e)}`\n\n"
+            f"Please try again or contact [support]({SUPPORT_LINK}).",
+            link_preview=False
+        )
+    finally:
+        # Clean up
+        if os.path.exists(input_file):
+            try:
+                os.remove(input_file)
+            except:
+                pass
+        
+        # Clean up any remaining segment files
+        import glob
+        segment_files = glob.glob(output_pattern.replace("%03d", "*"))
+        for file in segment_files:
+            try:
+                os.remove(file)
+            except:
+                pass
+
+
+# Enhanced callback for split mode with additional options
+@bot.on(events.CallbackQuery(data=b"mode_split"))
+async def split_mode_handler(event):
+    """Handle selection of split mode with options"""
+    user_id = event.sender_id
+    
+    # Check if user has an active video
+    if user_id not in user_states or not user_states[user_id].original_message:
+        await event.answer("Please send a video first!", alert=True)
+        return
+    
+    await event.answer()
+    
+    # Offer different splitting options
+    split_options = (
+        "**🪓 SPLIT MODE Selected**\n\n"
+        "Choose how you'd like to split your video:"
+    )
+    
+    buttons = [
+        [Button.inline("1-Minute Segments (Default)", b"confirm_split")],
+        [Button.inline("Custom Duration Segments", b"custom_split")],
+        [Button.inline("❌ Cancel", b"cancel_split")]
+    ]
+    
+    await event.edit(split_options, buttons=buttons)
+
+
+# Add command to show help
+@bot.on(events.NewMessage(pattern='/help'))
+async def help_handler(event):
+    """Handle /help command"""
+    help_text = (
+        "**📋 Video Trimmer Bot Help**\n\n"
+        "**Available Commands:**\n"
+        "• `/start` - Start the bot and see welcome message\n"
+        "• `/help` - Show this help message\n\n"
+        
+        "**How to Trim a Video:**\n"
+        "1. Send any video file to the bot\n"
+        "2. Select 'Trim Video' option\n"
+        "3. Enter start and end times (format: `00:30 02:15`)\n\n"
+        
+        "**How to Split a Video:**\n"
+        "1. Send any video file to the bot\n"
+        "2. Select 'Split into 1-Min Parts' option\n"
+        "3. Confirm or select custom duration\n"
+        "4. Wait for the bot to process and upload all parts\n\n"
+        
+        "**Time Format:**\n"
+        "• For times less than 1 hour: `MM:SS`\n"
+        "• For times more than 1 hour: `HH:MM:SS`\n\n"
+        
+        "**Examples:**\n"
+        "• `00:30 02:15` - Trim from 30 seconds to 2 minutes 15 seconds\n"
+        "• `01:25:00 01:35:30` - Trim from 1 hour 25 minutes to 1 hour 35 minutes 30 seconds\n\n"
+        
+        "If you encounter any issues, please contact our support."
+    )
+    
+    buttons = [
+        [Button.url("Support Channel", SUPPORT_LINK)]
+    ]
+    
+    await event.respond(help_text, buttons=buttons)
+
+
+# Set up the bot
+async def main():
+    # Start the bot
+    print("Starting bot...")
+    await bot.start(bot_token=BOT_TOKEN)
+    print("Bot started!")
+    
+    # Set bot commands
+    from telethon.tl.functions.bots import SetBotCommandsRequest
+    from telethon.tl.types import BotCommand
+    
+    commands = [
+        BotCommand(command="start", description="Start the bot"),
+        BotCommand(command="help", description="Show help information")
+    ]
+    
+    try:
+        await bot(SetBotCommandsRequest(
+            scope=telethon.tl.types.BotCommandScopeDefault(),
+            lang_code="",
+            commands=commands
+        ))
+        print("Bot commands set successfully")
+    except Exception as e:
+        print(f"Failed to set bot commands: {e}")
+    
+    # Run the bot until disconnected
+    await bot.run_until_disconnected()
+
+# Run the bot
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
