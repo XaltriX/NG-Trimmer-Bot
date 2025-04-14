@@ -1,0 +1,15 @@
+version: '3'
+
+services:
+  video-trimmer-bot:
+    build: .
+    restart: always
+    volumes:
+      - ./data:/app/data
+      - ./downloads:/app/downloads
+      - ./processed:/app/processed 
+      - ./thumbnails:/app/thumbnails
+    env_file:
+      - .env
+    environment:
+      - TZ=UTC
