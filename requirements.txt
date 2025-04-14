@@ -1,1 +1,3 @@
-python-telegram-bot
+telethon==1.30.3
+asyncio==3.4.3
+python-dotenv==1.0.0
